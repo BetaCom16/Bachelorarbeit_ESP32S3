@@ -11,3 +11,12 @@ Folgender Code wird benötigt, um das heruntergeladene Modell in ein C-Byte-Arra
 
 Innerhalb des Programmcodes für den ESP32-S3 wird zusammen mit dem seeed Erweiterungsboard ein Bild mittels der Kamera OV5640 aufgenommen, welches anschließend zugeschnitten und mittels Nearest-Neighbor-Interpolation in ein Bildformat skaliert wird, welches mit dem übereinstimmt, das auch für das Training verwendet wurde. Die anschließende Inferenz gibt eine Vorhersage über die am meisten erkannte Pflanzenart aus. Sobald der Programmcode auf den ESP32-S3 übertragen wurde, startet der Monitor und die Messungen können ausgeführt und ausgelesen werden.
 
+Der verwendete Programmcode sollte für andere Architekturen als MobileNet und dem TinyCNN genutzt werden können, jedoch wurde dies nicht überprüft. Ich falle eines Architekturwechsels sollten die vom Modell benötigten Operatoren überprüft werden, um die begrenzten Ressourcen des ESP32-S3 zu berücksichtigen, was mit folgendem Code in Google Colab erreicht werden kann. Folgender Code ließt beispielsweise die Operatoren für MobileNetV1 aus:
+
+```
+import tensorflow as tf
+
+tf.lite.experimental.Analyzer.analyze(
+    model_path="mobilenet_v1_int8.tflite"
+)
+```
