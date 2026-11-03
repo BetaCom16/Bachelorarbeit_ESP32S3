@@ -1,4 +1,4 @@
-# Bachelorarbeit_ESP32S3-
+# Kurzüberblick der Bachelorarbeit
 Dieses Repository ist Bestandteil der Bachelorarbeit von Erik Pardey. Thema ist die automatisierte Bildklassifikation von Nutzpflanzen und Unkraut auf einem ressourcenbeschränkten eingebetteten System wie den ESP32-S3. Es beinhaltet den Programmcode für einen ESP32-S3 mit OV5640 Kameramodul und die dazugehörigen Jupyter Notebooks, um die Modelle für das maschinelle Lernen in Google Colab zu trainieren.
 
 Stand 03.11.2026 wurde innerhalb des Projekts TensorFlow in der Version 2.20.0 und Keras in der Version 3.13.2 verwendet. Microsoft Visual Studio Code nutzte die Version 1.140, die Erweiterung ESP-IDF Version 4.1.0. Um Fehler zu vermeiden sollten beim Nachbau des Projekts die genannten Versionen der Komponenten berücksichtigt werden.
