@@ -398,3 +398,190 @@ Im letzten Schritt müssen die Farbwerte in das INT8-Format umgewandelt werden, 
 }
 ```
 
+
+## Einbinden des Modells
+Die folgende Zeile bindet das Modell ein, indem mittels **GetModel** auf das Byte-Array des Modells in der Datei **model_data.cc** zugegriffen wird.
+```
+const tflite::Model* model = tflite::GetModel(pflanzenmodell_mobilenet1_int8_tflite);
+```
+
+## Definition der Tensor-Arena
+Der folgende Block definiert die Tensor-Arena und legt den reservierten Speicher im PSRAM des ESP32-S3 ab.
+```
+    uint8_t* tensor_arena = static_cast<uint8_t*>(
+            heap_caps_malloc(
+                ARENA_SIZE,
+                MALLOC_CAP_SPIRAM |
+                MALLOC_CAP_8BIT
+            )
+        );
+```
+## Überprüfung der Tensor-Arena
+Folgende Abfrage prüft, ob die Tensor-Arena angelegt werden konnte. Andernfalls wird **nullptr** zurückgegeben, was bedeutet, dass der Zeiger auf keinen gültigen Speicherbereich zeigt.
+```
+    if (tensor_arena == nullptr) {
+        printf("Tensor-Arena Reservierung fehlgeschlagen\n");
+        return;
+    }
+```
+
+
+## Modelloperationen einbinden
+Folgender Block definiert die Operationen, die das Modell verwendet.
+```
+tflite::MicroMutableOpResolver<11> resolver;
+    resolver.AddConv2D();
+    resolver.AddDepthwiseConv2D();
+    resolver.AddAdd();
+    resolver.AddSub();
+    resolver.AddMul();
+    resolver.AddMean();
+    resolver.AddFullyConnected();
+    resolver.AddSoftmax();
+    resolver.AddReshape();
+    resolver.AddQuantize();
+    resolver.AddDequantize();
+```
+
+## Definition des MicroInterpreters
+Der MicroInterpreter führt die Inferenz aus. Hierzu definiert er das jeweilige Modell, die vorgegebenen Operationen und die Tensor-Arena mit dem zugewiesenen Speicherplatz. Dieser Block erstellt den Interpreter - die Inferenz wird hier noch nicht ausgeführt.
+```
+tflite::MicroInterpreter interpreter(
+        model,
+        resolver,
+        tensor_arena,
+        ARENA_SIZE
+    );
+```
+
+
+## Tensoren vorbereiten
+Dieser Block bereitet die Tensoren vor, woraufhin auf den Eingabetensor in **input** zugegriffen werden kann.
+```
+if (interpreter.AllocateTensors() != kTfLiteOk) {
+    printf("AllocateTensors fehlgeschlagen!\n");
+    return;
+    }
+
+TfLiteTensor* input = interpreter.input(0);
+TfLiteTensor* output = interpreter.output(0);
+```
+
+## Ausgabe der genutzten Tensor-Arena
+Folgende Zeile liest aus, wie viele Bytes innerhalb des reservierten Arenabereichs tatsächlich genutzt wurden.
+```
+printf("Tensor-Arena genutzt: %u Bytes\n", (unsigned) interpreter.arena_used_bytes());
+```
+
+
+## Kameraprüfung und -vorbereitung
+Die erste Abfrage prüft, ob die Kamera korrekt initialisiert wurde. Andernfalls wird das Programm beendet. War die Initialisierung erfolgreich, werden zu Beginn des Programms einmalig 5 Bilder aufgenommen und verworfen. Dies wurde implementiert, um durch eine mögliche Startverzögerung der Kamera die Inferenz nicht zu verfälschen.
+```
+if (!init_kamera()) {
+        printf("Kamera Fehler - Programm wird abgebrochen\n");
+        return;
+    }
+
+    for (int i = 0; i < 5; i++) {
+        camera_fb_t* fb = esp_camera_fb_get();
+
+        if (fb != nullptr) {
+            esp_camera_fb_return(fb);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+```
+
+
+
+## Inferenz und Ausgabe
+Hier startet eine Schleife und darin die Inferenz. Insgesamt werden 30 Messungen mit einer Pause von 5 Sekunden nach jeder Inferenz durchgeführt. Dieser Block holt das aufgenommene Bild aus dem Framebuffer und prüft, ob eine Bildaufnahme überhaupt stattfinden konnte. Anschließend wird das jeweilige Bild durch die weiter oben erklärte Funktion **bild_vorbereiten** verarbeitet.
+```
+for (int messung = 1; messung <= 30; messung++) {
+
+        camera_fb_t* fb = esp_camera_fb_get();
+
+        if (fb == nullptr) {
+            printf("Bildaufnahme fehlgeschlagen\n");
+            return;
+        }
+
+        bild_vorbereiten(fb, input);
+
+        esp_camera_fb_return(fb);
+```
+
+Hier wird ein Zeitstempel gesetzt, die Inferenz ausgeführt und anschließend wird ein weiterer Zeitstempel gesetzt, der vom vorherigen abgezogen wird, wodurch die Inferenzlatenz gemessen werden konnte.
+```
+
+        int64_t start = esp_timer_get_time();
+
+        if (interpreter.Invoke() != kTfLiteOk) {
+            printf("Inferenz fehlgeschlagen\n");
+            return;
+        }
+
+        int64_t dauer_ms = (esp_timer_get_time() - start) / 1000;
+```
+
+Hier wird überprüft, welche Vorhersage das Modell für die jeweilige Inferenz getroffen hat. Die Variable **beste_klasse** beginnt bei 0, was der Klasse Boden entspräche. Das Ergebnis der Inferenz beinhaltet für die drei Klassen Werte, die Vorhersagewerte. Diese werden den Indexen der Klasse zugewiesen. Index 0 = Boden, Index 1 = Nutzpflanze, Index 2 = Unkraut. Die Schleife prüft folgendes: Ist der ausgegebene Wert von Index 1, also von der Nutzpflanze, höher als vom Boden, so wird Index 1 als beste Klasse festgelegt. 
+
+Anschließend wird noch weiter geprüft, ob der Wert aus der Inferenz für den Index 2, also für Unkraut, höher als für die bisher beste Klasse ist. Ist dies nicht der Fall, bleibt Nutzpflanze die beste Klasse, ansonsten wird erhält die Variable den Wert 2, da Unkraut als beste Klasse identifiziert wurde.
+```
+
+        int beste_klasse = 0;
+
+        for (int i = 1; i < 3; i++) {
+            if (output->data.int8[i] > output->data.int8[beste_klasse]) {
+                beste_klasse = i;
+            }
+        }
+```
+
+Hier findet eine Dequantisierung statt. Die INT8-Ausgabewerte werden in Gleitkommazahlen umgewandelt und mit 100 multipliziert, um eine Prozentdarstellung zu erhalten.
+```
+        float v_boden =(output->data.int8[0] - output->params.zero_point) * output->params.scale * 100.0f;
+        float v_nutzpflanze = (output->data.int8[1] - output->params.zero_point) * output->params.scale * 100.0f;
+        float v_unkraut = (output->data.int8[2] - output->params.zero_point) * output->params.scale * 100.0f;
+```
+
+Der folgende Block gibt die Anzahl der Messungen, die beste Klasse, die Prozentzahlen der jeweiligen Klassen und die Inferenzlatenz aus. Die Abfrage am Ende prüft, ob alle 30 Messungen durchgeführt wurden. Wenn dies der Fall ist, wird das Programm beeendet, andernfalls beginnt der Vorgang mit der Bildverarbeitung und der Inferenz von vorne.
+```
+        printf(
+            "Messung %d/30 | "
+            "Erkannt: %s | "
+            "Boden: %.1f %% | "
+            "Nutzpflanze: %.1f %% | "
+            "Unkraut: %.1f %% | "
+            "Inferenz: %lld ms\n",
+            messung,
+            KLASSEN[beste_klasse],
+            v_boden,
+            v_nutzpflanze,
+            v_unkraut,
+            dauer_ms
+        );
+
+        if (messung < 30) {
+            vTaskDelay(pdMS_TO_TICKS(5000));
+        }
+    }
+```
+
+Hier wird der freie RAM- und PSRAM-Speicher sowie die reservierte und genutzte Tensor-Arena ausgegeben.
+```
+    size_t freier_ram = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    size_t freier_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+
+    printf("\n--- RAM und PSRAM ---\n");
+    printf("Freier RAM: %u Bytes\n", (unsigned)freier_ram);
+    printf("Freier PSRAM: %u Bytes\n\n",(unsigned)freier_psram);
+
+    printf("--- Tensor-Arena ---\n");
+    printf("Tensor-Arena reserviert: %u Bytes\n",(unsigned)ARENA_SIZE);
+    printf("Tensor-Arena genutzt: %u Bytes\n", (unsigned) interpreter.arena_used_bytes());
+```
+
+
+
