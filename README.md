@@ -5,10 +5,6 @@ Stand 03.11.2026 wurde innerhalb des Projekts TensorFlow in der Version 2.20.0 u
 
 Die Jupyter-Notebooks können verwendet werden, um z.B. in Google Colab die Modelle MobileNetV1, MobileNetV2 und eine eigene Architektur zu trainieren. Dazu werden die Rohdaten vorbereitet und auf die Datensätze Training, Validierung und Test aufgeteilt. Nach dem Training lässt sich diese in das LiteRT-Format überführen, um auf dem ESP32-S3 ausführbar zu werden. Der anschließende Code beinhaltet das Auslesen von Metriken und der jeweiligen Confusion Matrix des FLOAT32- und INT8-Formats.
 
-Folgender Code wird benötigt, um das heruntergeladene Modell in ein C-Byte-Array zu überführen, damit der ESP32-S3 dieses ausführen kann. Dieser kann im Terminal eines Linux Betriebssystems ausgeführt werden. Diese model_data.cc Datei wird im Verzeichnis "main" des Projekts abgelegt:
-``` xxd -i MODELLNAME.tflite > model_data.cc ```
-
-
 Innerhalb des Programmcodes für den ESP32-S3 wird zusammen mit dem seeed Erweiterungsboard ein Bild mittels der Kamera OV5640 aufgenommen, welches anschließend zugeschnitten und mittels Nearest-Neighbor-Interpolation in ein Bildformat skaliert wird, welches mit dem übereinstimmt, das auch für das Training verwendet wurde. Die anschließende Inferenz gibt eine Vorhersage über die am meisten erkannte Pflanzenart aus. Sobald der Programmcode auf den ESP32-S3 übertragen wurde, startet der Monitor und die Messungen können ausgeführt und ausgelesen werden.
 
 Der verwendete Programmcode sollte für andere Architekturen als MobileNet und dem TinyCNN genutzt werden können, jedoch wurde dies nicht überprüft. Im Falle eines Architekturwechsels sollten die vom Modell benötigten Operatoren überprüft werden, um die begrenzten Ressourcen des ESP32-S3 zu berücksichtigen, was mit folgendem Code in Google Colab erreicht werden kann. Folgender Code liest beispielsweise die Operatoren für MobileNetV1 aus:
@@ -231,3 +227,174 @@ ConfusionMatrixDisplay.from_predictions(
 plt.title("MobileNetV1 INT8 Confusion Matrix")
 plt.show()
 ```
+
+
+# ESP32-S3 Programmcode
+## Vorbereitung des Modells
+Folgender Code wird benötigt, um das heruntergeladene Modell in ein C-Byte-Array zu überführen, damit der ESP32-S3 dieses ausführen kann. Dieser kann im Terminal eines Linux Betriebssystems ausgeführt werden. Die model_data.cc Datei wird im Verzeichnis "main" des Projekts abgelegt:
+``` 
+xxd -i MODELLNAME.tflite > model_data.cc
+```
+
+## Bibliotheken importieren
+Folgende Bibliotheken müssen zu Beginn des Projekts importiert werden. Diese umfassen grundlegende C++- und spezifische ESP-Bibliotheken sowie den Inport von TensorFlow Lite Micro. Dies muss zuvor in das Projekt importiert werden:
+
+```
+idf.py add-dependency "espressif/esp-tflite-micro"
+```
+
+``` 
+#include <cstdio>
+#include <cstdint>
+#include <algorithm>
+#include "esp_camera.h"
+#include "esp_timer.h"
+#include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "model_data.h"
+
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+```
+
+## GPIO's des ESP32-S3 deklarieren
+Folgender Block definiert die standardmäßigen GPIO's des ESP32-S3:
+
+```
+#define PWDN_GPIO_NUM     -1
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM     10
+#define SIOD_GPIO_NUM     40
+#define SIOC_GPIO_NUM     39
+#define Y9_GPIO_NUM       48
+#define Y8_GPIO_NUM       11
+#define Y7_GPIO_NUM       12
+#define Y6_GPIO_NUM       14
+#define Y5_GPIO_NUM       16
+#define Y4_GPIO_NUM       18
+#define Y3_GPIO_NUM       17
+#define Y2_GPIO_NUM       15
+#define VSYNC_GPIO_NUM    38
+#define HREF_GPIO_NUM     47
+#define PCLK_GPIO_NUM     13
+```
+
+## Definition der Tensor-Arena und Klassen
+Dies definiert die Tensor-Arena und ein Array, welches die Klassen für die Vorhersagen beinhaltet.
+```
+constexpr size_t ARENA_SIZE = 2 * 1024 * 1024;
+
+const char* KLASSEN[] = {
+    "Boden",
+    "Nutzpflanze",
+    "Unkraut"
+};
+```
+
+## Initialisierung der Kamera
+Folgende Funktion konfiguriert die GPIO's des ESP32-S3 und legt Parameter für die Kamera wie z.B. Auflösung und RGB-Format fest. Zum Schluss wird true oder false zurückgegeben, je nachdem ob die Initialisierung der Kamera erfolgreich war oder nicht. Ohne eine erfolgreiche Initialisierung kann keine Bildaufnahme stattfinden.
+```
+bool init_kamera() {
+    camera_config_t config = {};
+    config.pin_pwdn = PWDN_GPIO_NUM;
+    config.pin_reset = RESET_GPIO_NUM;
+    config.pin_xclk = XCLK_GPIO_NUM;
+    config.pin_sccb_sda = SIOD_GPIO_NUM;
+    config.pin_sccb_scl = SIOC_GPIO_NUM;
+    config.pin_d7 = Y9_GPIO_NUM;
+    config.pin_d6 = Y8_GPIO_NUM;
+    config.pin_d5 = Y7_GPIO_NUM;
+    config.pin_d4 = Y6_GPIO_NUM;
+    config.pin_d3 = Y5_GPIO_NUM;
+    config.pin_d2 = Y4_GPIO_NUM;
+    config.pin_d1 = Y3_GPIO_NUM;
+    config.pin_d0 = Y2_GPIO_NUM;
+    config.pin_vsync = VSYNC_GPIO_NUM;
+    config.pin_href = HREF_GPIO_NUM;
+    config.pin_pclk = PCLK_GPIO_NUM;
+    config.xclk_freq_hz = 20000000;
+    config.pixel_format = PIXFORMAT_RGB565;
+    config.frame_size = FRAMESIZE_SVGA;
+    config.fb_count = 1;
+    config.fb_location = CAMERA_FB_IN_PSRAM;
+    config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+
+    return esp_camera_init(&config) == ESP_OK;
+}
+```
+
+
+
+## Vorverarbeitung des Bildes
+Der folgende größere Codeblock ist für die korrekte Bildvorverarbeitung von großer Wichtigkeit. Ohne diesen werden die Bilder nicht so verarbeitet, wie sie auch beim Training verarbeitet wurden. Die Verarbeitung zwischen Training und Verarbeitung auf dem ESP32-S3 muss konsistent erfolgen. Der Block beginnt mit einem Zeiger auf die Struktur des Kamera-Framebuffers, welcher die Bildinformationen beinhaltet, und einen Zeiger auf den Eingabetensor, worin die vorbereiteten Bilddaten gespeichert werden. Mittels **crop_size** wird der niedrigste Wert der Bildhöhe und -breite ermittelt. Wird das aktuelle Projekt betrachtet, so ist von der 800x600 Pixel Auflösung der Wert 600 der niedrigste Wert, welcher in der Variable **crop_size** gespeichert wird.
+```
+void bild_vorbereiten(
+    camera_fb_t* fb,
+    TfLiteTensor* input
+) {
+
+    int crop_size = std::min(
+        static_cast<int>(fb->width),
+        static_cast<int>(fb->height)
+    );
+```
+
+Die folgenden zwei Zeilen dienen dazu, um den Ausschnitt des Bildes zentriert festzuhalten. Das Bild ist 600 Pixel hoch, weshalb der Wert der Variable **y_offset** 0 beträgt. Die Variable **x_offset** definiert den horizontalen Versatz des Bildauschnitts.. Da diese bei der Aufnahme 800 Pixel beträgt, muss ein Ausschnitt definiert werden. Um diesen Ausschnitt zu zentrieren, müssen rechts und links davon jeweils 100 Pixel abgezogen werden, wodurch der 600 Pixel breite Ausschnitt zentriert platziert wird. 
+```
+    int x_offset = (static_cast<int>(fb->width) - crop_size) / 2;
+    int y_offset = (static_cast<int>(fb->height) - crop_size) / 2;
+```
+
+Der folgende Block definiert zwei Schleifen, in denen die Nearest-Neighbor-Interpolation angewendet wird. Hierzu wird zu aller erst die Schleife für die Höhe definiert. Da das Eingangsbild so wie auch beim Training auf auf 96x96 skaliert werden soll, beginnt der Wert der **y-Variable** bei 0. Mittels der Variable **source_y** wird berechnet, welcher Pixel des ursprünglichen Kamerabildes für einen bestimmten Pixel des verkleinerten Bildes verwendet wird. Mit der in der x-Schleife befindlichen Variable **source_x** geschieht das gleiche, nur für die Breite und nicht für die Höhe. Dieser Vorgang wird als Nearest-Neighbor-Interpolation bezeichnet. 
+
+**Beispiel**: Das Bild wird nach und nach zusammengesetzt und nun soll der Pixel bei y = 20 und x = 10 des 96x96 großen Bildes erstellt werden. Mithilfe der Formel von **source_y** und **source_x** ergibt sich folgendes: 
+**source_y**: 0 + 20 * 600 / 96 = 125
+**source_x**: 100 + 10 * 600 / 96 = 162
+
+Das bedeutet, dass der Pixel mit den Koordinaten y = 20 und x = 10 die Farbwerte des Pixels aus dem Ursprungsbild aus der Zeile 125 und Position 162 erhält.
+
+Direkt im Anschluss daran beginnt die Schleife für die Breite. Es lässt sich so vereinfacht vorstellen: Ein Pixel beginnt in der Zeile 0. Nun beginnt die x-Schleife damit, diese y-Zeile mit insgesamt 96 Pixeln zu füllen. Sobald dies erfolgte, springt die y-Schleife auf den Wert 1, woraufhin die x-Schleife auch diese Zeile vollständig mit Pixel füllt. Woher diese Pixel stammen, wird in kommenden Codeblöcken erläutert. Die Erklärung diente lediglich dem Verständnis, wie aus dem 600x600 Pixel Ausschnitt ein 96x96 Bild entsteht. Ohne den Ausschnitt von 600x600 würde das Bild verzerrt werden, wenn es von 800x600 auf 96x96 skaliert werden würde.
+
+```
+
+    for (int y=0; y < 96; y++) {
+        int source_y =y_offset + y * crop_size / 96;
+        for (int x=0; x < 96; x++) {
+
+            int source_x = x_offset + x * crop_size / 96;
+```
+
+In diesem Projekt wurde RGB565 verwendet, um Speicherplatz einzusparen. Die Pixelwerte werden im Speicher des ESP32-S3 abgelegt. In der vorherigen Beispielrechnung konnte herausgefunden werden, dass der Pixel bei y = 20 und x = 10 Farbwerte aus dem Ursprungsbild aus Zeile 125 an Position 162 erhält. Diese Werte werden für das kommende Beispiel beibehalten. Im Speicher des Framebuffers beginnt der Pixel an der Position des Bytes 200324. Die Berechnung sieht dafür wie folgt aus: (125 * 800 + 162) * 2 = 200324. RGB565 setzt sich aus zwei Bytes zusammen, weshalb am Ende der Berechnung mit 2 multipliziert wird. Der Code dafür sieht wie folgt aus:
+```
+            size_t source_index = (static_cast<size_t>(source_y) * fb->width + source_x) * 2;
+```
+
+Folgende Codezeile ließt die zwei Bytes des jeweiligen Pixels aus. Hierfür wird **uint16_t** verwendet, ein Ganzzahltyp mit 16 Bit. Hierzu das erste Byte ausgelesenm welches mittels **<< 8** um 8 Bit nach links verschoben wird. Anschließend wird das zweite Byte ausgelesen, welches mit dem ersten Byte zu einem 16-Bit-Wert kombiniert wird.
+```
+            uint16_t pixel = (static_cast<uint16_t> (fb->buf[source_index]) << 8) | fb->buf[source_index + 1];
+```
+
+Im nächsten Schritt wird RGB565 in RGB888 umgewandelt, da das Modell RGB-Werte mit 8-Bit pro Kanal erwartet. Dazu wird der 16-Bit-Pixel in die drei Farbkanäle zerlegt. Bei RGB565 verwendet rot 5 Bit, grün 6 Bit und blau ebenfalls 5 Bit. Hierzu wurden drei Variablen für die drei Farbkanäle definiert. Rot wird um 11 Bitstellen nach rechts verschoben. Mittels der Bitmaske **0x1F**, werden nur die letzten 5 Bits behalten. Darauf folgt die Verschiebung von Grün um 5 Stellen nach rechts mit der Bitmaske 0x3F. Anschließend folgt Blau zusammen mit der Bitmaske 0x1F. Die Berechnung * 255 / 31 bzw. 63 skaliert den Bereich auf 0 - 255.
+```
+            int r =((pixel >> 11) & 0x1F) * 255 / 31;
+            int g =((pixel >> 5) & 0x3F) * 255 / 63;
+            int b = (pixel & 0x1F) * 255 / 31;
+```
+
+Folgende Zeile berechnet die Position im Eingabetensor. Dieser enthält 96 x 96 Pixel mit jeweils drei Farbwerten. **Beispiel**: Genommen werden wieder die Werte aus den vorherigen Beispielen, also y = 20 und x = 10. Daraus folgt die Berechnung: (20 * 96 + 10) * 3 = 5790. Die drei Farbkanäle liegen also an folgenden Indizes im Speicher: Index 5790 für Rot, 5791 für Grün und 5792 für Blau.
+```
+            size_t target_index = (y * 96 + x) * 3;
+```
+
+Im letzten Schritt müssen die Farbwerte in das INT8-Format umgewandelt werden, damit das Modell diese verarbeiten kann. Die Werte liegen bisher im Wertebereich zwischen 0 und 255 vor, was sich außerhalb des INT8-Bereichs befindet. Die verwendeten INT8-Modelle können nur Werte zwischen -128 und 127 verarbeiten. Nun kommen die zu Beginn erwähnten Quantisierungsparameter zum Einsatz. Bei der Quantisierung wurden der Skalierungsfaktor **scale = 1** und der Nullpunkt **zero_point = -128** verwendet. Durch die folgende Berechnung hat beispielsweise ein RGB-Wert von 128 den INT8-Wert 0 und 255 wären der INT8-Wert 127. Diese Werte werden in die Eingabetensor geschrieben. Im Anschluss daran endet die Vorverarbeitung für das jeweilige Bild.
+```
+            input->data.int8[target_index] = static_cast<int8_t>(r - 128);
+            input->data.int8[target_index + 1] = static_cast<int8_t>(g - 128);
+            input->data.int8[target_index + 2] = static_cast<int8_t>(b - 128);
+        }
+    }
+}
+```
+
